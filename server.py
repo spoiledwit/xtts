@@ -10,14 +10,15 @@ import asyncio
 import io
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 # Third-party imports
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -40,13 +41,31 @@ torch.load = _patched_torch_load
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(title="XTTS TTS Service", version="1.1.0")
-
 # Global model variables
 xtts_model = None  # Direct XTTS model instance
 xtts_config = None
 tts_device = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for model loading and cleanup."""
+    try:
+        load_xtts_model()
+        yield
+    except Exception as e:
+        logger.error(f"Startup failed: {e}", exc_info=True)
+        raise
+    finally:
+        logger.info("Shutting down XTTS server")
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="XTTS TTS Service",
+    version="1.1.0",
+    lifespan=lifespan,
+)
 
 
 class TTSRequest(BaseModel):
@@ -61,32 +80,38 @@ class TTSRequest(BaseModel):
 
 
 def load_xtts_model():
-    """Load the XTTS model on startup."""
+    """Load the XTTS model on startup with auto-download support."""
     global xtts_model, xtts_config, tts_device
 
-    model_path = os.getenv("TTS_MODEL_PATH", "/opt/xtts")
-    model_dir = Path(model_path)
+    model_path = os.getenv("TTS_MODEL_PATH", "")
 
-    if not model_dir.exists():
-        raise RuntimeError(f"Model directory not found: {model_path}")
-
-    # Check for required files
-    required_files = ["config.json", "model.pth"]
-    for file in required_files:
-        if not (model_dir / file).exists():
-            raise RuntimeError(f"Required model file not found: {model_dir / file}")
-
-    logger.info(f"Loading XTTS model from: {model_path}")
     logger.info(f"CUDA available: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}")
-    
-    # Determine device
     tts_device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {tts_device}")
 
     try:
-        # Load XTTS model directly using the model class (no Synthesizer wrapper)
-        from TTS.tts.models.xtts import Xtts
         from TTS.tts.configs.xtts_config import XttsConfig
+        from TTS.tts.models.xtts import Xtts
+        from TTS.utils.manage import ModelManager
+
+        # If model path provided and exists, load from there
+        if model_path and Path(model_path).exists():
+            model_dir = Path(model_path)
+            logger.info(f"Loading XTTS model from local path: {model_path}")
+        else:
+            # Auto-download using TTS ModelManager
+            logger.info("Model path not found, auto-downloading XTTS v2...")
+            model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
+            manager = ModelManager()
+            model_path_result, config_path, _ = manager.download_model(model_name)
+            model_dir = Path(model_path_result).parent
+            logger.info(f"Model downloaded to: {model_dir}")
+
+        # Check for required files
+        required_files = ["config.json", "model.pth"]
+        for file in required_files:
+            if not (model_dir / file).exists():
+                raise RuntimeError(f"Required model file not found: {model_dir / file}")
 
         # Load config
         config = XttsConfig()
@@ -95,7 +120,7 @@ def load_xtts_model():
         # Initialize model from config
         model_instance = Xtts.init_from_config(config)
 
-        # Load checkpoint - pass both directory and file path
+        # Load checkpoint
         checkpoint_dir = str(model_dir)
         checkpoint_path = str(model_dir / "model.pth")
         vocab_path = str(model_dir / "vocab.json")
@@ -108,23 +133,21 @@ def load_xtts_model():
             checkpoint_path=checkpoint_path,
             vocab_path=vocab_path,
             speaker_file_path=speaker_file_path,
-            use_deepspeed=False
+            use_deepspeed=False,
         )
 
         if tts_device == "cuda":
             model_instance.cuda()
         else:
-            # CPU optimizations for faster inference
             num_threads = int(os.getenv("TORCH_NUM_THREADS", "4"))
             torch.set_num_threads(num_threads)
             logger.info(f"CPU mode: Using {num_threads} threads for inference")
             model_instance.eval()
 
-        # Store model and config for direct use
         xtts_model = model_instance
         xtts_config = config
 
-        logger.info("XTTS model loaded successfully from local path")
+        logger.info("XTTS model loaded successfully")
 
     except Exception as e:
         logger.error(f"Failed to load XTTS model: {e}", exc_info=True)
@@ -162,16 +185,6 @@ def get_speaker_latents(speaker_id: str):
         speaker_embedding = speaker_embedding.cuda()
     
     return gpt_cond_latent, speaker_embedding
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Load the model when the server starts."""
-    try:
-        load_xtts_model()
-    except Exception as e:
-        logger.error(f"Startup failed: {e}", exc_info=True)
-        raise
 
 
 @app.get("/health")
@@ -514,7 +527,14 @@ async def root():
     }
 
 
-# Application entry point
-if __name__ == "__main__":
+def main():
+    """Application entry point."""
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5002)
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "5002"))
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()
