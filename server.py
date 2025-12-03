@@ -19,6 +19,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -65,6 +66,16 @@ app = FastAPI(
     title="XTTS TTS Service",
     version="1.1.0",
     lifespan=lifespan,
+)
+
+# Add CORS middleware to allow requests from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["X-Audio-Format", "X-Audio-Encoding", "X-Audio-Sample-Rate", "X-Audio-Channels"],
 )
 
 
