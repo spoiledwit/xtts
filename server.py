@@ -85,6 +85,9 @@ def load_xtts_model():
 
     model_path = os.getenv("TTS_MODEL_PATH", "")
 
+    # Accept XTTS license automatically (CPML non-commercial license)
+    os.environ["COQUI_TOS_AGREED"] = "1"
+
     logger.info(f"CUDA available: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}")
     tts_device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {tts_device}")
@@ -102,7 +105,7 @@ def load_xtts_model():
             # Auto-download using TTS ModelManager
             logger.info("Model path not found, auto-downloading XTTS v2...")
             model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
-            manager = ModelManager()
+            manager = ModelManager(progress_bar=True)
             model_path_result, config_path, _ = manager.download_model(model_name)
             model_dir = Path(model_path_result).parent
             logger.info(f"Model downloaded to: {model_dir}")
