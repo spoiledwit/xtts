@@ -72,11 +72,17 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allow all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
+    allow_credentials=False,  # Must be False when allow_origins is "*"
+    allow_methods=["GET", "POST", "OPTIONS"],  # Explicitly list methods
     allow_headers=["*"],  # Allow all headers
     expose_headers=["X-Audio-Format", "X-Audio-Encoding", "X-Audio-Sample-Rate", "X-Audio-Channels"],
 )
+
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    """Handle CORS preflight requests."""
+    return {}
 
 
 class TTSRequest(BaseModel):
