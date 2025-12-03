@@ -1,0 +1,520 @@
+"""
+FastAPI server for Coqui XTTS v2 text-to-speech service.
+
+This server loads the XTTS model on startup and provides HTTP endpoints
+for text-to-speech synthesis, including real-time streaming.
+"""
+
+# Standard library imports
+import asyncio
+import io
+import logging
+import os
+from pathlib import Path
+from typing import Optional, AsyncGenerator
+
+# Third-party imports
+import numpy as np
+import soundfile as sf
+import torch
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+# Patch torch.load to use weights_only=False for XTTS checkpoint loading
+# PyTorch 2.6+ defaults to weights_only=True for security, but XTTS checkpoints
+# contain custom classes that need to be loaded
+_original_torch_load = torch.load
+
+
+def _patched_torch_load(*args, **kwargs):
+    """Patch torch.load to allow loading XTTS checkpoints."""
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+
+
+torch.load = _patched_torch_load
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(title="XTTS TTS Service", version="1.1.0")
+
+# Global model variables
+xtts_model = None  # Direct XTTS model instance
+xtts_config = None
+tts_device = None
+
+
+class TTSRequest(BaseModel):
+    """Request model for TTS synthesis."""
+    text: str
+    voice: str = "en_US-lessac-medium"  # Legacy field (not used)
+    speed: float = 1.0  # Playback speed multiplier (not yet implemented)
+    language: Optional[str] = None  # Language code (e.g., "en", "es", "fr")
+    speaker_id: Optional[str] = None  # Built-in speaker name (e.g., "Daisy Studious", "Gracie Wise")
+    stream_chunk_size: Optional[int] = 20  # Chunk size for streaming (smaller = lower latency)
+    # Note: 58 built-in speakers available. See speakers_xtts.pth for full list.
+
+
+def load_xtts_model():
+    """Load the XTTS model on startup."""
+    global xtts_model, xtts_config, tts_device
+
+    model_path = os.getenv("TTS_MODEL_PATH", "/opt/xtts")
+    model_dir = Path(model_path)
+
+    if not model_dir.exists():
+        raise RuntimeError(f"Model directory not found: {model_path}")
+
+    # Check for required files
+    required_files = ["config.json", "model.pth"]
+    for file in required_files:
+        if not (model_dir / file).exists():
+            raise RuntimeError(f"Required model file not found: {model_dir / file}")
+
+    logger.info(f"Loading XTTS model from: {model_path}")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}")
+    
+    # Determine device
+    tts_device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {tts_device}")
+
+    try:
+        # Load XTTS model directly using the model class (no Synthesizer wrapper)
+        from TTS.tts.models.xtts import Xtts
+        from TTS.tts.configs.xtts_config import XttsConfig
+
+        # Load config
+        config = XttsConfig()
+        config.load_json(str(model_dir / "config.json"))
+
+        # Initialize model from config
+        model_instance = Xtts.init_from_config(config)
+
+        # Load checkpoint - pass both directory and file path
+        checkpoint_dir = str(model_dir)
+        checkpoint_path = str(model_dir / "model.pth")
+        vocab_path = str(model_dir / "vocab.json")
+        speaker_file_path = str(model_dir / "speakers_xtts.pth")
+
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
+        model_instance.load_checkpoint(
+            config,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_path=checkpoint_path,
+            vocab_path=vocab_path,
+            speaker_file_path=speaker_file_path,
+            use_deepspeed=False
+        )
+
+        if tts_device == "cuda":
+            model_instance.cuda()
+        else:
+            # CPU optimizations for faster inference
+            num_threads = int(os.getenv("TORCH_NUM_THREADS", "4"))
+            torch.set_num_threads(num_threads)
+            logger.info(f"CPU mode: Using {num_threads} threads for inference")
+            model_instance.eval()
+
+        # Store model and config for direct use
+        xtts_model = model_instance
+        xtts_config = config
+
+        logger.info("XTTS model loaded successfully from local path")
+
+    except Exception as e:
+        logger.error(f"Failed to load XTTS model: {e}", exc_info=True)
+        raise
+
+
+def get_speaker_latents(speaker_id: str):
+    """
+    Get speaker conditioning latents for streaming inference.
+    
+    Returns:
+        tuple: (gpt_cond_latent, speaker_embedding)
+    """
+    if not hasattr(xtts_model, 'speaker_manager') or xtts_model.speaker_manager is None:
+        raise ValueError("Speaker manager not available")
+    
+    if speaker_id not in xtts_model.speaker_manager.speakers:
+        available = list(xtts_model.speaker_manager.speakers.keys())[:5]
+        raise ValueError(f"Speaker '{speaker_id}' not found. Available: {available}...")
+    
+    speaker_data = xtts_model.speaker_manager.speakers[speaker_id]
+    
+    gpt_cond_latent = speaker_data.get("gpt_cond_latent")
+    speaker_embedding = speaker_data.get("speaker_embedding")
+    
+    # Convert to tensors if needed and move to correct device
+    if isinstance(gpt_cond_latent, np.ndarray):
+        gpt_cond_latent = torch.from_numpy(gpt_cond_latent)
+    if isinstance(speaker_embedding, np.ndarray):
+        speaker_embedding = torch.from_numpy(speaker_embedding)
+    
+    # Ensure correct device
+    if tts_device == "cuda":
+        gpt_cond_latent = gpt_cond_latent.cuda()
+        speaker_embedding = speaker_embedding.cuda()
+    
+    return gpt_cond_latent, speaker_embedding
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Load the model when the server starts."""
+    try:
+        load_xtts_model()
+    except Exception as e:
+        logger.error(f"Startup failed: {e}", exc_info=True)
+        raise
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    if xtts_model is None:
+        return {"status": "unhealthy", "error": "Model not loaded"}
+    return {
+        "status": "healthy",
+        "device": tts_device,
+        "model_loaded": xtts_model is not None,
+        "streaming_supported": True
+    }
+
+
+@app.get("/speakers")
+async def list_speakers():
+    """List available built-in speakers."""
+    if xtts_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    if hasattr(xtts_model, 'speaker_manager') and xtts_model.speaker_manager is not None:
+        speakers = list(xtts_model.speaker_manager.speakers.keys())
+        return {"speakers": speakers, "count": len(speakers)}
+    
+    return {"speakers": [], "count": 0, "note": "No speaker manager available"}
+
+
+@app.post("/tts")
+async def synthesize_speech(request: TTSRequest):
+    """
+    Synthesize speech from text (non-streaming).
+
+    Returns audio as a complete WAV file.
+    """
+    if xtts_model is None or xtts_config is None:
+        raise HTTPException(
+            status_code=503,
+            detail="TTS model not loaded. Check server logs."
+        )
+
+    if not request.text or not request.text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty"
+        )
+
+    try:
+        logger.info(f"Synthesizing: '{request.text[:50]}...' (language: {request.language or 'en'})")
+
+        speaker_id = request.speaker_id or "Ana Florence"
+        logger.info(f"Using speaker: {speaker_id}")
+
+        with torch.inference_mode():
+            result = xtts_model.synthesize(
+                text=request.text,
+                config=xtts_config,
+                speaker_wav=None,
+                language=request.language or "en",
+                speaker_id=speaker_id
+            )
+
+        # Handle return value
+        if isinstance(result, dict):
+            wav = result.get('wav', result)
+            sample_rate = result.get('sample_rate', 22050)
+        elif isinstance(result, tuple):
+            wav = result[0]
+            sample_rate = result[1] if len(result) > 1 else 22050
+        else:
+            wav = result
+            sample_rate = 22050
+
+        # Convert to numpy
+        if isinstance(wav, torch.Tensor):
+            wav = wav.detach().cpu().numpy()
+        elif isinstance(wav, list):
+            wav = np.array(wav)
+        elif not isinstance(wav, np.ndarray):
+            wav = np.array(wav)
+
+        # Ensure 1D
+        if wav.ndim > 1:
+            wav = wav.flatten()
+
+        # Ensure float32
+        if wav.dtype != np.float32:
+            wav = wav.astype(np.float32)
+
+        # Normalize audio
+        max_val = np.abs(wav).max()
+        if max_val > 0:
+            target_max = 0.95
+            if max_val < 0.1:
+                wav = wav * (target_max / max_val) * 0.5
+            else:
+                wav = wav * (target_max / max_val)
+
+        wav = np.clip(wav, -1.0, 1.0)
+
+        logger.info(f"Audio shape: {wav.shape}, sample_rate: {sample_rate}")
+
+        # Convert to WAV bytes
+        buffer = io.BytesIO()
+        sf.write(buffer, wav, sample_rate, format='WAV')
+        buffer.seek(0)
+
+        return StreamingResponse(
+            io.BytesIO(buffer.getvalue()),
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": 'attachment; filename="tts_output.wav"'
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"TTS synthesis failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"TTS synthesis failed: {str(e)}"
+        )
+
+
+@app.post("/tts/stream")
+async def synthesize_speech_stream(request: TTSRequest):
+    """
+    Synthesize speech with real-time streaming.
+    
+    Returns audio chunks as they're generated using chunked transfer encoding.
+    Audio format: Raw PCM float32, mono, 24kHz
+    
+    Client should read chunks and play them as they arrive for low-latency playback.
+    """
+    if xtts_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    speaker_id = request.speaker_id or "Ana Florence"
+    language = request.language or "en"
+    chunk_size = request.stream_chunk_size or 20
+
+    try:
+        # Get speaker latents before starting the generator
+        gpt_cond_latent, speaker_embedding = get_speaker_latents(speaker_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    async def audio_generator() -> AsyncGenerator[bytes, None]:
+        """Generate audio chunks in real-time."""
+        try:
+            logger.info(f"Starting stream: '{request.text[:50]}...' speaker={speaker_id}")
+            
+            with torch.inference_mode():
+                # Use inference_stream for real-time chunk generation
+                chunks = xtts_model.inference_stream(
+                    text=request.text,
+                    language=language,
+                    gpt_cond_latent=gpt_cond_latent,
+                    speaker_embedding=speaker_embedding,
+                    stream_chunk_size=chunk_size,
+                    enable_text_splitting=True,
+                    speed=request.speed
+                )
+                
+                chunk_count = 0
+                total_samples = 0
+                
+                for chunk in chunks:
+                    # Convert tensor to numpy
+                    if isinstance(chunk, torch.Tensor):
+                        chunk_np = chunk.detach().cpu().numpy()
+                    else:
+                        chunk_np = np.array(chunk)
+                    
+                    # Ensure float32
+                    if chunk_np.dtype != np.float32:
+                        chunk_np = chunk_np.astype(np.float32)
+                    
+                    # Flatten if needed
+                    if chunk_np.ndim > 1:
+                        chunk_np = chunk_np.flatten()
+                    
+                    # Normalize chunk
+                    max_val = np.abs(chunk_np).max()
+                    if max_val > 1.0:
+                        chunk_np = chunk_np / max_val * 0.95
+                    
+                    chunk_np = np.clip(chunk_np, -1.0, 1.0)
+                    
+                    chunk_count += 1
+                    total_samples += len(chunk_np)
+                    
+                    # Yield raw PCM bytes
+                    yield chunk_np.tobytes()
+                    
+                    # Allow other async tasks to run
+                    await asyncio.sleep(0)
+                
+                logger.info(f"Stream complete: {chunk_count} chunks, {total_samples} samples")
+                
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            raise
+
+    return StreamingResponse(
+        audio_generator(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Type": "application/octet-stream",
+            "X-Audio-Format": "pcm",
+            "X-Audio-Encoding": "float32",
+            "X-Audio-Sample-Rate": "24000",
+            "X-Audio-Channels": "1",
+            "Transfer-Encoding": "chunked",
+            "Cache-Control": "no-cache"
+        }
+    )
+
+
+@app.post("/tts/stream/wav")
+async def synthesize_speech_stream_wav(request: TTSRequest):
+    """
+    Synthesize speech with streaming, but return as WAV with proper header.
+    
+    Note: This buffers audio internally but streams the final WAV.
+    For true low-latency streaming, use /tts/stream with raw PCM.
+    
+    This endpoint is useful for clients that can't handle raw PCM
+    but want streaming transfer encoding.
+    """
+    if xtts_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    speaker_id = request.speaker_id or "Ana Florence"
+    language = request.language or "en"
+    chunk_size = request.stream_chunk_size or 20
+
+    try:
+        gpt_cond_latent, speaker_embedding = get_speaker_latents(speaker_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    async def wav_generator() -> AsyncGenerator[bytes, None]:
+        """Generate WAV file with streamed chunks."""
+        try:
+            logger.info(f"Starting WAV stream: '{request.text[:50]}...'")
+            
+            all_chunks = []
+            
+            with torch.inference_mode():
+                chunks = xtts_model.inference_stream(
+                    text=request.text,
+                    language=language,
+                    gpt_cond_latent=gpt_cond_latent,
+                    speaker_embedding=speaker_embedding,
+                    stream_chunk_size=chunk_size,
+                    enable_text_splitting=True,
+                    speed=request.speed
+                )
+                
+                for chunk in chunks:
+                    if isinstance(chunk, torch.Tensor):
+                        chunk_np = chunk.detach().cpu().numpy()
+                    else:
+                        chunk_np = np.array(chunk)
+                    
+                    if chunk_np.dtype != np.float32:
+                        chunk_np = chunk_np.astype(np.float32)
+                    
+                    if chunk_np.ndim > 1:
+                        chunk_np = chunk_np.flatten()
+                    
+                    all_chunks.append(chunk_np)
+                    await asyncio.sleep(0)
+            
+            # Concatenate all chunks
+            full_audio = np.concatenate(all_chunks)
+            
+            # Normalize
+            max_val = np.abs(full_audio).max()
+            if max_val > 0:
+                full_audio = full_audio / max_val * 0.95
+            full_audio = np.clip(full_audio, -1.0, 1.0)
+            
+            # Convert to WAV
+            buffer = io.BytesIO()
+            sf.write(buffer, full_audio, 24000, format='WAV')
+            buffer.seek(0)
+            
+            # Stream the WAV in chunks
+            chunk_size_bytes = 8192
+            while True:
+                data = buffer.read(chunk_size_bytes)
+                if not data:
+                    break
+                yield data
+            
+            logger.info(f"WAV stream complete: {len(full_audio)} samples")
+            
+        except Exception as e:
+            logger.error(f"WAV streaming error: {e}", exc_info=True)
+            raise
+
+    return StreamingResponse(
+        wav_generator(),
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": 'attachment; filename="tts_output.wav"',
+            "Transfer-Encoding": "chunked"
+        }
+    )
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with service information."""
+    return {
+        "service": "XTTS TTS Service",
+        "version": "1.1.0",
+        "model_loaded": xtts_model is not None,
+        "device": tts_device,
+        "endpoints": {
+            "health": "/health - Health check",
+            "speakers": "/speakers - List available speakers",
+            "tts": "/tts (POST) - Full audio synthesis (returns WAV)",
+            "tts_stream": "/tts/stream (POST) - Real-time streaming (returns raw PCM)",
+            "tts_stream_wav": "/tts/stream/wav (POST) - Streaming with WAV output"
+        },
+        "streaming": {
+            "format": "Raw PCM float32",
+            "sample_rate": 24000,
+            "channels": 1,
+            "note": "Use /tts/stream for lowest latency"
+        }
+    }
+
+
+# Application entry point
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5002)
