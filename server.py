@@ -107,7 +107,8 @@ def load_xtts_model():
             model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
             manager = ModelManager(progress_bar=True)
             model_path_result, config_path, _ = manager.download_model(model_name)
-            model_dir = Path(model_path_result).parent
+            # model_path_result is the model.pth file, config_path is config.json
+            model_dir = Path(config_path).parent
             logger.info(f"Model downloaded to: {model_dir}")
 
         # Check for required files
