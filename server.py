@@ -175,36 +175,73 @@ def load_xtts_model():
         raise
 
 
+# Reference audio path for voice cloning
+REFERENCE_AUDIO_PATH = os.getenv("REFERENCE_AUDIO_PATH", "ref.mp3")
+
+# Cache for cloned voice latents
+_cloned_voice_cache = {}
+
+
+def get_cloned_voice_latents(reference_audio: str):
+    """
+    Get speaker conditioning latents from a reference audio file (voice cloning).
+
+    Returns:
+        tuple: (gpt_cond_latent, speaker_embedding)
+    """
+    global _cloned_voice_cache
+
+    # Check cache first
+    if reference_audio in _cloned_voice_cache:
+        logger.info(f"Using cached latents for: {reference_audio}")
+        return _cloned_voice_cache[reference_audio]
+
+    if not Path(reference_audio).exists():
+        raise ValueError(f"Reference audio not found: {reference_audio}")
+
+    logger.info(f"Computing voice latents from: {reference_audio}")
+
+    # Compute conditioning latents from reference audio
+    gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+        audio_path=reference_audio
+    )
+
+    # Cache the result
+    _cloned_voice_cache[reference_audio] = (gpt_cond_latent, speaker_embedding)
+
+    return gpt_cond_latent, speaker_embedding
+
+
 def get_speaker_latents(speaker_id: str):
     """
     Get speaker conditioning latents for streaming inference.
-    
+
     Returns:
         tuple: (gpt_cond_latent, speaker_embedding)
     """
     if not hasattr(xtts_model, 'speaker_manager') or xtts_model.speaker_manager is None:
         raise ValueError("Speaker manager not available")
-    
+
     if speaker_id not in xtts_model.speaker_manager.speakers:
         available = list(xtts_model.speaker_manager.speakers.keys())[:5]
         raise ValueError(f"Speaker '{speaker_id}' not found. Available: {available}...")
-    
+
     speaker_data = xtts_model.speaker_manager.speakers[speaker_id]
-    
+
     gpt_cond_latent = speaker_data.get("gpt_cond_latent")
     speaker_embedding = speaker_data.get("speaker_embedding")
-    
+
     # Convert to tensors if needed and move to correct device
     if isinstance(gpt_cond_latent, np.ndarray):
         gpt_cond_latent = torch.from_numpy(gpt_cond_latent)
     if isinstance(speaker_embedding, np.ndarray):
         speaker_embedding = torch.from_numpy(speaker_embedding)
-    
+
     # Ensure correct device
     if tts_device == "cuda":
         gpt_cond_latent = gpt_cond_latent.cuda()
         speaker_embedding = speaker_embedding.cuda()
-    
+
     return gpt_cond_latent, speaker_embedding
 
 
@@ -332,12 +369,13 @@ async def synthesize_speech(request: TTSRequest):
 @app.post("/tts/stream")
 async def synthesize_speech_stream(request: TTSRequest):
     """
-    Synthesize speech with real-time streaming.
-    
+    Synthesize speech with real-time streaming using cloned voice.
+
     Returns audio chunks as they're generated using chunked transfer encoding.
     Audio format: Raw PCM float32, mono, 24kHz
-    
-    Client should read chunks and play them as they arrive for low-latency playback.
+
+    Uses reference audio (ref.mp3) for voice cloning by default.
+    Set speaker_id to use a built-in speaker instead.
     """
     if xtts_model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -345,13 +383,18 @@ async def synthesize_speech_stream(request: TTSRequest):
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
-    speaker_id = request.speaker_id or "Ana Florence"
     language = request.language or "en"
     chunk_size = request.stream_chunk_size or 20
 
     try:
-        # Get speaker latents before starting the generator
-        gpt_cond_latent, speaker_embedding = get_speaker_latents(speaker_id)
+        # Use cloned voice from reference audio by default
+        # If speaker_id is provided, use built-in speaker instead
+        if request.speaker_id:
+            gpt_cond_latent, speaker_embedding = get_speaker_latents(request.speaker_id)
+            logger.info(f"Using built-in speaker: {request.speaker_id}")
+        else:
+            gpt_cond_latent, speaker_embedding = get_cloned_voice_latents(REFERENCE_AUDIO_PATH)
+            logger.info(f"Using cloned voice from: {REFERENCE_AUDIO_PATH}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
