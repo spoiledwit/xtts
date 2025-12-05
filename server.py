@@ -401,7 +401,7 @@ async def synthesize_speech_stream(request: TTSRequest):
     async def audio_generator() -> AsyncGenerator[bytes, None]:
         """Generate audio chunks in real-time."""
         try:
-            logger.info(f"Starting stream: '{request.text[:50]}...' speaker={speaker_id}")
+            logger.info(f"Starting stream: '{request.text[:50]}...' speaker={request.speaker_id or 'cloned'}")
             
             with torch.inference_mode():
                 # Use inference_stream for real-time chunk generation
